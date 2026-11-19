@@ -1,0 +1,337 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Identity & access (single-owner SaaS: one user = one personal workspace)
+// ---------------------------------------------------------------------------
+
+model User {
+  id           String    @id @default(cuid())
+  email        String    @unique
+  passwordHash String
+  fullName     String
+  avatarUrl    String?
+  timezone     String    @default("Asia/Kolkata")
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  sessions     Session[]
+  auditLogs    AuditLog[]
+  workspace    Workspace?
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  token     String   @unique
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}
+
+// ---------------------------------------------------------------------------
+// Workspace (exactly one per owner)
+// ---------------------------------------------------------------------------
+
+model Workspace {
+  id        String   @id @default(cuid())
+  ownerId   String   @unique
+  owner     User     @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  name      String
+  timezone  String   @default("Asia/Kolkata")
+  planId    String   @default("free")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  workflows             Workflow[]
+  connections           Connection[]
+  webhookEndpoints      WebhookEndpoint[]
+  schedules             Schedule[]
+  executions            Execution[]
+  folders               WorkflowFolder[]
+  notificationPrefs     NotificationPreference[]
+  usageRecords          UsageRecord[]
+  notifications         NotificationRecord[]
+  auditLogs             AuditLog[]
+  subscription          Subscription?
+}
+
+// ---------------------------------------------------------------------------
+// Workflows & versions (immutable published snapshots)
+// ---------------------------------------------------------------------------
+
+model WorkflowFolder {
+  id          String   @id @default(cuid())
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  name        String
+  createdAt   DateTime @default(now())
+
+  @@unique([workspaceId, name])
+}
+
+model Workflow {
+  id                    String   @id @default(cuid())
+  workspaceId           String
+  workspace             Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  folderId              String?
+  name                  String
+  description           String?
+  status                String   @default("draft") // draft | active | inactive | archived
+  isFavorite            Boolean  @default(false)
+  currentDraftVersionId String?
+  publishedVersionId    String?
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  versions         WorkflowVersion[]
+  executions       Execution[]
+  webhookEndpoints WebhookEndpoint[]
+  schedules        Schedule[]
+
+  @@index([workspaceId, status])
+}
+
+model WorkflowVersion {
+  id              String   @id @default(cuid())
+  workflowId      String
+  workflow        Workflow @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  versionNumber   Int
+  graphDefinition String // serialized WorkflowGraph JSON
+  validationResult String? // serialized validation result JSON
+  isActive        Boolean  @default(false)
+  createdAt       DateTime @default(now())
+  publishedAt     DateTime?
+
+  @@unique([workflowId, versionNumber])
+}
+
+// ---------------------------------------------------------------------------
+// Credential vault (AES-256-GCM encrypted)
+// ---------------------------------------------------------------------------
+
+model Connection {
+  id                  String    @id @default(cuid())
+  workspaceId         String
+  workspace           Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  provider            String // resend | slack-webhook | discord-webhook | supabase | http-basic | http-bearer | http-header
+  name                String
+  encryptedCredentials String   // ciphertext JSON {iv, tag, data}
+  encryptionVersion   Int       @default(1)
+  status              String    @default("untested") // untested | connected | failed | config_required
+  lastTestedAt        DateTime?
+  lastTestResult      String?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  @@index([workspaceId])
+}
+
+// ---------------------------------------------------------------------------
+// Triggers
+// ---------------------------------------------------------------------------
+
+model WebhookEndpoint {
+  id                 String   @id @default(cuid())
+  workspaceId        String
+  workspace          Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  workflowId         String
+  workflow           Workflow @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  publicIdentifier   String   @unique
+  encryptedSecret    String
+  method             String   @default("POST")
+  enabled            Boolean  @default(true)
+  createdAt          DateTime @default(now())
+
+  deliveries WebhookDelivery[]
+
+  @@index([workflowId])
+}
+
+model WebhookDelivery {
+  id          String   @id @default(cuid())
+  endpointId  String
+  endpoint    WebhookEndpoint @relation(fields: [endpointId], references: [id], onDelete: Cascade)
+  receivedAt  DateTime @default(now())
+  status      String // accepted | rejected | error
+  statusCode  Int?
+  contentType String?
+  sizeBytes   Int?
+  executionId String?
+  message     String?
+}
+
+model Schedule {
+  id                 String   @id @default(cuid())
+  workspaceId        String
+  workspace          Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  workflowId         String
+  workflow           Workflow @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  workflowVersionId  String
+  cronExpression     String
+  timezone           String
+  nextRunAt          DateTime
+  lastRunAt          DateTime?
+  enabled            Boolean  @default(true)
+  lastDispatchStatus String?
+  lastDispatchAt     DateTime?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  @@unique([workflowId])
+  @@index([enabled, nextRunAt])
+}
+
+// ---------------------------------------------------------------------------
+// Executions (durable, checkpointed at every node)
+// ---------------------------------------------------------------------------
+
+model Execution {
+  id                String    @id @default(cuid())
+  workspaceId       String
+  workspace         Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  workflowId        String
+  workflow          Workflow  @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  workflowVersionId String
+  triggerType       String // manual | webhook | schedule | retry | replay
+  triggerData       String? // JSON: trigger payload
+  testMode          Boolean   @default(false)
+  status            String    @default("queued") // queued|running|waiting|succeeded|failed|cancelled|timed_out
+  cancelRequested   Boolean   @default(false)
+  waitUntil         DateTime?
+  startedAt         DateTime?
+  finishedAt        DateTime?
+  durationMs        Int?
+  error             String? // JSON {message, details}
+  createdAt         DateTime  @default(now())
+
+  steps  ExecutionStep[]
+  events ExecutionEvent[]
+
+  @@index([workspaceId, createdAt])
+  @@index([workflowId, createdAt])
+  @@index([status])
+  @@index([status, waitUntil])
+}
+
+model ExecutionStep {
+  id            String   @id @default(cuid())
+  executionId   String
+  execution     Execution @relation(fields: [executionId], references: [id], onDelete: Cascade)
+  nodeId        String
+  nodeType      String
+  status        String // pending|running|waiting|succeeded|failed|skipped|cancelled
+  inputData     String? // JSON
+  outputData    String? // JSON
+  itemIndex     Int? // loop iteration this step belongs to
+  attemptNumber Int      @default(1)
+  startedAt     DateTime?
+  finishedAt    DateTime?
+  durationMs    Int?
+  error         String? // JSON
+
+  @@index([executionId, nodeId])
+}
+
+model ExecutionEvent {
+  id         String   @id @default(cuid())
+  executionId String
+  execution  Execution @relation(fields: [executionId], references: [id], onDelete: Cascade)
+  nodeId     String?
+  severity   String   @default("info") // debug|info|warn|error
+  eventType  String
+  message    String
+  metadata   String? // JSON
+  createdAt  DateTime @default(now())
+
+  @@index([executionId, createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Notifications
+// ---------------------------------------------------------------------------
+
+model NotificationPreference {
+  id              String   @id @default(cuid())
+  workspaceId     String
+  workspace       Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  notificationType String
+  enabled         Boolean  @default(true)
+  createdAt       DateTime @default(now())
+
+  @@unique([workspaceId, notificationType])
+}
+
+model NotificationRecord {
+  id          String   @id @default(cuid())
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  type        String // execution_failed | execution_succeeded | integration_alert | usage_limit | billing
+  title       String
+  body        String
+  channel     String   @default("in_app") // in_app | email
+  emailStatus String? // sent | failed | skipped_no_provider
+  readAt      DateTime?
+  createdAt   DateTime @default(now())
+
+  @@index([workspaceId, createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Usage & billing
+// ---------------------------------------------------------------------------
+
+model UsageRecord {
+  id                  String   @id @default(cuid())
+  workspaceId         String
+  workspace           Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  periodStart         DateTime
+  periodEnd           DateTime
+  executionCount      Int      @default(0)
+  nodeOperationCount  Int      @default(0)
+  updatedAt           DateTime @updatedAt
+
+  @@unique([workspaceId, periodStart])
+}
+
+model Subscription {
+  id                    String   @id @default(cuid())
+  workspaceId           String   @unique
+  workspace             Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  provider              String   @default("razorpay")
+  planId                String   @default("free")
+  status                String   @default("active") // active | past_due | cancelled
+  providerCustomerId    String?
+  providerSubscriptionId String?
+  currentPeriodStart    DateTime?
+  currentPeriodEnd      DateTime?
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Audit
+// ---------------------------------------------------------------------------
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  workspaceId String?
+  workspace  Workspace? @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  userId     String?
+  user       User?     @relation(fields: [userId], references: [id], onDelete: SetNull)
+  action     String
+  entityType String?
+  entityId   String?
+  metadata   String?
+  createdAt  DateTime @default(now())
+
+  @@index([workspaceId, createdAt])
+}
